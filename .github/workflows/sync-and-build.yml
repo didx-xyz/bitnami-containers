@@ -569,7 +569,7 @@ jobs:
     runs-on: ubuntu-24.04
     name: Build Summary
     needs: [sync-upstream, discover-containers, build, push-manifests, check-critical-failure]
-    if: always() && (needs.sync-upstream.outputs.has-changes == 'true' || github.event_name == 'workflow_dispatch')
+    if: always()
     steps:
       - name: Generate summary
         run: |
