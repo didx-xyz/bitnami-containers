@@ -76,7 +76,7 @@ jobs:
     runs-on: ubuntu-24.04
     name: Discover changed containers
     needs: sync-upstream
-    if: needs.sync-upstream.outputs.has-changes == 'true' || github.event_name == 'workflow_dispatch'
+    if: needs.sync-upstream.outputs.has-changes == 'true'
     outputs:
       matrix: ${{ steps.discover.outputs.matrix }}
       containers-count: ${{ steps.discover.outputs.containers-count }}
