@@ -396,7 +396,7 @@ jobs:
     name: Create Multi-Arch Manifests
     runs-on: ubuntu-24.04
     needs: [sync-upstream, discover-containers, build]
-    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-containers.outputs.containers-count != '0' && !contains(needs.build.result, 'failure')
+    if: always() && needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-containers.outputs.containers-count != '0' && needs.build.result != 'cancelled'
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -568,7 +568,7 @@ jobs:
   build-summary:
     runs-on: ubuntu-24.04
     name: Build Summary
-    needs: [sync-upstream, discover-containers, build, push-manifests]
+    needs: [sync-upstream, discover-containers, build, push-manifests, check-critical-failure]
     if: always() && (needs.sync-upstream.outputs.has-changes == 'true' || github.event_name == 'workflow_dispatch')
     steps:
       - name: Generate summary
@@ -582,7 +582,19 @@ jobs:
           if [ "${CONTAINER_COUNT}" = "0" ]; then
             echo "- **Build status:** ⏭️ No containers changed - no builds needed" >> $GITHUB_STEP_SUMMARY
           else
-            echo "- **Build status:** ${BUILD_RESULT}" >> $GITHUB_STEP_SUMMARY
+            # Determine the appropriate build status message
+            if [ "${BUILD_RESULT}" = "success" ]; then
+              echo "- **Build status:** ✅ All builds completed successfully" >> $GITHUB_STEP_SUMMARY
+            elif [ "${BUILD_RESULT}" = "failure" ] && [ "${HAS_AMD64_FAILURE}" = "false" ]; then
+              echo "- **Build status:** ⚠️ Some ARM64 builds failed (expected for unsupported containers)" >> $GITHUB_STEP_SUMMARY
+            elif [ "${BUILD_RESULT}" = "failure" ] && [ "${HAS_AMD64_FAILURE}" = "true" ]; then
+              echo "- **Build status:** ❌ Critical AMD64 build failures detected" >> $GITHUB_STEP_SUMMARY
+            elif [ "${BUILD_RESULT}" = "failure" ]; then
+              echo "- **Build status:** ⚠️ Some builds failed (analyzing...)" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Build status:** ${BUILD_RESULT}" >> $GITHUB_STEP_SUMMARY
+            fi
+
             echo "- **Manifest status:** ${PUSH_MANIFEST_RESULT}" >> $GITHUB_STEP_SUMMARY
           fi
 
@@ -608,6 +620,7 @@ jobs:
           CONTAINER_COUNT: ${{ needs.discover-containers.outputs.containers-count }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
+          HAS_AMD64_FAILURE: ${{ needs.check-critical-failure.outputs.has-amd64-failure }}
 
       - name: Report status
         run: |
@@ -615,7 +628,14 @@ jobs:
             echo "✅ Sync completed successfully - no container changes detected, no builds needed!"
           elif [ "${BUILD_RESULT}" = "success" ] && [ "${PUSH_MANIFEST_RESULT}" = "success" ]; then
             echo "🎉 All changed container builds and manifests completed successfully!"
-          elif [ "${BUILD_RESULT}" = "failure" ] || [ "${PUSH_MANIFEST_RESULT}" = "failure" ]; then
+          elif [ "${BUILD_RESULT}" = "failure" ] && [ "${HAS_AMD64_FAILURE}" = "false" ] && [ "${PUSH_MANIFEST_RESULT}" = "success" ]; then
+            echo "✅ Builds completed successfully! Some ARM64 builds failed (expected for containers without ARM64 support)"
+          elif [ "${HAS_AMD64_FAILURE}" = "true" ]; then
+            echo "❌ Critical AMD64 build failures detected. Rollback initiated."
+            exit 1
+          elif [ "${BUILD_RESULT}" = "failure" ] && [ "${PUSH_MANIFEST_RESULT}" = "success" ]; then
+            echo "✅ Builds completed successfully! Some ARM64 builds failed (expected for containers without ARM64 support)"
+          else
             echo "❌ Some builds or manifests failed. Check the job logs for details."
             exit 1
           fi
@@ -624,12 +644,47 @@ jobs:
           CONTAINER_COUNT: ${{ needs.discover-containers.outputs.containers-count }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
+          HAS_AMD64_FAILURE: ${{ needs.check-critical-failure.outputs.has-amd64-failure }}
+
+  check-critical-failure:
+    runs-on: ubuntu-24.04
+    name: Check for critical AMD64 failures
+    needs: [sync-upstream, discover-containers, build, push-manifests]
+    if: always() && needs.build.result == 'failure' && needs.sync-upstream.outputs.has-changes == 'true'
+    outputs:
+      has-amd64-failure: ${{ steps.check.outputs.has-amd64-failure }}
+    steps:
+      - name: Check for AMD64 build failures
+        id: check
+        run: |
+          echo "Analyzing build failures to determine if AMD64 builds failed..."
+          echo "Build result: ${{ needs.build.result }}"
+          echo "Push manifests result: ${{ needs.push-manifests.result }}"
+
+          # Logic:
+          # - If push-manifests succeeded, then AMD64 must have succeeded (only ARM64 failed)
+          # - If push-manifests failed or was skipped, it could indicate AMD64 failure
+          # - If push-manifests was skipped due to build failure, we need to be conservative
+
+          if [ "${{ needs.push-manifests.result }}" = "success" ]; then
+            echo "Push manifests succeeded - AMD64 builds were successful, only ARM64 failed (acceptable)"
+            echo "has-amd64-failure=false" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.push-manifests.result }}" = "failure" ]; then
+            echo "Push manifests failed - this indicates AMD64 build failure (critical)"
+            echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
+          elif [ "${{ needs.push-manifests.result }}" = "skipped" ]; then
+            echo "Push manifests was skipped - assuming critical failure (conservative approach)"
+            echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
+          else
+            echo "Push manifests result unclear - assuming critical failure (conservative approach)"
+            echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
+          fi
 
   rollback-on-failure:
     runs-on: ubuntu-24.04
     name: Rollback main branch on critical failure
-    needs: [sync-upstream, discover-containers, build]
-    if: always() && needs.build.result == 'failure' && needs.sync-upstream.outputs.has-changes == 'true'
+    needs: [sync-upstream, discover-containers, build, check-critical-failure]
+    if: always() && needs.check-critical-failure.outputs.has-amd64-failure == 'true'
     permissions:
       contents: write
     steps:
