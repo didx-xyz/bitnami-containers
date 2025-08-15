@@ -618,11 +618,61 @@ jobs:
           elif [ "${BUILD_RESULT}" = "failure" ] || [ "${PUSH_MANIFEST_RESULT}" = "failure" ]; then
             echo "❌ Some builds or manifests failed. Check the job logs for details."
             exit 1
-          else
-            echo "⚠️ Build jobs were cancelled or skipped."
           fi
 
         env:
           CONTAINER_COUNT: ${{ needs.discover-containers.outputs.containers-count }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
+
+  rollback-on-failure:
+    runs-on: ubuntu-24.04
+    name: Rollback main branch on critical failure
+    needs: [sync-upstream, discover-containers, build]
+    if: always() && needs.build.result == 'failure' && needs.sync-upstream.outputs.has-changes == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/bitnami/containers.git || true
+          git remote set-url upstream https://github.com/bitnami/containers.git
+
+      - name: Rollback main branch to pre-sync state
+        run: |
+          echo "🔄 CRITICAL FAILURE DETECTED - Rolling back main branch"
+          echo "Original commit (before sync): ${{ needs.sync-upstream.outputs.local-commit }}"
+          echo "Current commit (after sync): ${{ needs.sync-upstream.outputs.upstream-commit }}"
+
+          # Reset main branch back to the pre-sync commit
+          git reset --hard ${{ needs.sync-upstream.outputs.local-commit }}
+
+          # Force push the rollback
+          git push origin main --force
+
+          echo "✅ Successfully rolled back main branch to pre-sync state"
+          echo "Main branch is now at: $(git rev-parse HEAD)"
+
+      - name: Add rollback comment to summary
+        run: |
+          echo "# ⚠️ CRITICAL FAILURE - ROLLBACK PERFORMED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Rollback Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: AMD64 build failure detected" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: Main branch rolled back to pre-sync state" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous commit**: \`${{ needs.sync-upstream.outputs.local-commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reverted from**: \`${{ needs.sync-upstream.outputs.upstream-commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check the build logs to identify the AMD64 build failure" >> $GITHUB_STEP_SUMMARY
+          echo "2. The main branch has been restored to a working state" >> $GITHUB_STEP_SUMMARY
+          echo "3. The problematic upstream changes were not permanently synced" >> $GITHUB_STEP_SUMMARY
+          echo "4. The next sync will retry when upstream issues are resolved" >> $GITHUB_STEP_SUMMARY
