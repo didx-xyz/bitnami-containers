@@ -579,7 +579,7 @@ jobs:
           echo "- **Total changed containers:** ${CONTAINER_COUNT}" >> $GITHUB_STEP_SUMMARY
           echo "- **Sync status:** ${{ needs.sync-upstream.outputs.has-changes == 'true' && '✅ Changes synced from upstream' || '⏭️ No changes detected' }}" >> $GITHUB_STEP_SUMMARY
 
-          if [ "${CONTAINER_COUNT}" = "0" ]; then
+          if [ "${HAS_CHANGES}" = "false" ]; then
             echo "- **Build status:** ⏭️ No containers changed - no builds needed" >> $GITHUB_STEP_SUMMARY
           else
             # Determine the appropriate build status message
@@ -617,6 +617,7 @@ jobs:
           echo "---" >> $GITHUB_STEP_SUMMARY
           echo "*This workflow automatically syncs with [bitnami/containers](https://github.com/bitnami/containers) and builds only changed container images.*" >> $GITHUB_STEP_SUMMARY
         env:
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
           CONTAINER_COUNT: ${{ needs.discover-containers.outputs.containers-count }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
@@ -624,7 +625,7 @@ jobs:
 
       - name: Report status
         run: |
-          if [ "${CONTAINER_COUNT}" = "0" ]; then
+          if [ "${HAS_CHANGES}" = "false" ]; then
             echo "✅ Sync completed successfully - no container changes detected, no builds needed!"
           elif [ "${BUILD_RESULT}" = "success" ] && [ "${PUSH_MANIFEST_RESULT}" = "success" ]; then
             echo "🎉 All changed container builds and manifests completed successfully!"
@@ -641,6 +642,7 @@ jobs:
           fi
 
         env:
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
           CONTAINER_COUNT: ${{ needs.discover-containers.outputs.containers-count }}
           BUILD_RESULT: ${{ needs.build.result }}
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
@@ -658,27 +660,30 @@ jobs:
         id: check
         run: |
           echo "Analyzing build failures to determine if AMD64 builds failed..."
-          echo "Build result: ${{ needs.build.result }}"
-          echo "Push manifests result: ${{ needs.push-manifests.result }}"
+          echo "Build result: ${BUILD_RESULT}"
+          echo "Push manifests result: ${PUSH_MANIFESTS_RESULT}"
 
           # Logic:
           # - If push-manifests succeeded, then AMD64 must have succeeded (only ARM64 failed)
           # - If push-manifests failed or was skipped, it could indicate AMD64 failure
           # - If push-manifests was skipped due to build failure, we need to be conservative
 
-          if [ "${{ needs.push-manifests.result }}" = "success" ]; then
+          if [ "${PUSH_MANIFESTS_RESULT}" = "success" ]; then
             echo "Push manifests succeeded - AMD64 builds were successful, only ARM64 failed (acceptable)"
             echo "has-amd64-failure=false" >> $GITHUB_OUTPUT
-          elif [ "${{ needs.push-manifests.result }}" = "failure" ]; then
+          elif [ "${PUSH_MANIFESTS_RESULT}" = "failure" ]; then
             echo "Push manifests failed - this indicates AMD64 build failure (critical)"
             echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
-          elif [ "${{ needs.push-manifests.result }}" = "skipped" ]; then
+          elif [ "${PUSH_MANIFESTS_RESULT}" = "skipped" ]; then
             echo "Push manifests was skipped - assuming critical failure (conservative approach)"
             echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
           else
             echo "Push manifests result unclear - assuming critical failure (conservative approach)"
             echo "has-amd64-failure=true" >> $GITHUB_OUTPUT
           fi
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          PUSH_MANIFESTS_RESULT: ${{ needs.push-manifests.result }}
 
   rollback-on-failure:
     runs-on: ubuntu-24.04
@@ -704,17 +709,20 @@ jobs:
       - name: Rollback main branch to pre-sync state
         run: |
           echo "🔄 CRITICAL FAILURE DETECTED - Rolling back main branch"
-          echo "Original commit (before sync): ${{ needs.sync-upstream.outputs.local-commit }}"
-          echo "Current commit (after sync): ${{ needs.sync-upstream.outputs.upstream-commit }}"
+          echo "Original commit (before sync): ${LOCAL_COMMIT}"
+          echo "Current commit (after sync): ${UPSTREAM_COMMIT}"
 
           # Reset main branch back to the pre-sync commit
-          git reset --hard ${{ needs.sync-upstream.outputs.local-commit }}
+          git reset --hard ${LOCAL_COMMIT}
 
           # Force push the rollback
           git push origin main --force
 
           echo "✅ Successfully rolled back main branch to pre-sync state"
           echo "Main branch is now at: $(git rev-parse HEAD)"
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
 
       - name: Add rollback comment to summary
         run: |
@@ -723,11 +731,15 @@ jobs:
           echo "## 🔄 Rollback Details" >> $GITHUB_STEP_SUMMARY
           echo "- **Reason**: AMD64 build failure detected" >> $GITHUB_STEP_SUMMARY
           echo "- **Action**: Main branch rolled back to pre-sync state" >> $GITHUB_STEP_SUMMARY
-          echo "- **Previous commit**: \`${{ needs.sync-upstream.outputs.local-commit }}\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Reverted from**: \`${{ needs.sync-upstream.outputs.upstream-commit }}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous commit**: \`${LOCAL_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reverted from**: \`${UPSTREAM_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
           echo "1. Check the build logs to identify the AMD64 build failure" >> $GITHUB_STEP_SUMMARY
           echo "2. The main branch has been restored to a working state" >> $GITHUB_STEP_SUMMARY
           echo "3. The problematic upstream changes were not permanently synced" >> $GITHUB_STEP_SUMMARY
           echo "4. The next sync will retry when upstream issues are resolved" >> $GITHUB_STEP_SUMMARY
+
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
