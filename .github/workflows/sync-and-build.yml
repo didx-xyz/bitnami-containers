@@ -363,6 +363,27 @@ jobs:
         env:
           REF_NAME: ${{ steps.check-container.outputs.ref-name }}
 
+      - name: Mark build as successful
+        if: steps.check-container.outputs.exists == 'true'
+        run: |
+          echo "✅ Build completed successfully for ${{ matrix.arch }}"
+
+      - name: Container build failed (AMD64)
+        if: failure() && steps.check-container.outputs.exists == 'true' && matrix.arch == 'amd64'
+        run: |
+          echo "❌ CRITICAL: AMD64 build failed for ${{ matrix.container.name }}"
+          echo "AMD64 builds must succeed - this indicates a real problem with the container"
+          echo "Workflow will be stopped"
+          exit 1
+
+      - name: Container build failed (ARM64)
+        if: failure() && steps.check-container.outputs.exists == 'true' && matrix.arch == 'arm64'
+        run: |
+          echo "⚠️ ARM64 build failed for ${{ matrix.container.name }}"
+          echo "This is expected for some containers that don't support ARM64"
+          echo "The workflow will continue with AMD64 only"
+          exit 0
+
       - name: Container skipped
         if: steps.check-container.outputs.exists == 'false'
         run: |
@@ -375,7 +396,7 @@ jobs:
     name: Create Multi-Arch Manifests
     runs-on: ubuntu-24.04
     needs: [sync-upstream, discover-containers, build]
-    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-containers.outputs.containers-count != '0'
+    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.discover-containers.outputs.containers-count != '0' && !contains(needs.build.result, 'failure')
     strategy:
       fail-fast: false
       max-parallel: 5
@@ -453,8 +474,44 @@ jobs:
           # Extract tags from metadata action output
           tags="${TAGS}"
 
+          # Check which architectures were successfully built
+          amd64_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-amd64"
+          arm64_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-arm64"
+
+          echo "Checking available architectures..."
+
+          # Check if amd64 image exists (REQUIRED)
+          if docker buildx imagetools inspect "$amd64_image" >/dev/null 2>&1; then
+            echo "✅ AMD64 image available: $amd64_image"
+            amd64_available=true
+          else
+            echo "❌ CRITICAL: AMD64 image not available: $amd64_image"
+            echo "AMD64 is required - cannot create manifest without it"
+            exit 1
+          fi
+
+          # Check if arm64 image exists (OPTIONAL)
+          if docker buildx imagetools inspect "$arm64_image" >/dev/null 2>&1; then
+            echo "✅ ARM64 image available: $arm64_image"
+            arm64_available=true
+          else
+            echo "⚠️ ARM64 image not available: $arm64_image (this is acceptable)"
+            arm64_available=false
+          fi
+
+          # Determine which images to include in manifest (AMD64 is always included)
+          if [ "$arm64_available" = true ]; then
+            echo "Creating multi-arch manifest with both AMD64 and ARM64"
+            manifest_images="$amd64_image $arm64_image"
+            arch_summary="linux/amd64, linux/arm64"
+          else
+            echo "Creating single-arch manifest with AMD64 only (ARM64 not available)"
+            manifest_images="$amd64_image"
+            arch_summary="linux/amd64"
+          fi
+
           # Convert tags to array and create manifests for each tag
-          echo "Creating multi-arch manifests for tags:"
+          echo "Creating manifests for tags with architectures: $arch_summary"
           echo "$tags"
 
           # Process each tag
@@ -462,16 +519,14 @@ jobs:
             if [ -n "$tag" ]; then
               echo "Creating manifest for: $tag"
 
-              # Create multi-arch manifest combining both architectures
-              docker buildx imagetools create -t "$tag" \
-                "ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-amd64" \
-                "ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-arm64"
+              # Create manifest with available architectures
+              docker buildx imagetools create -t "$tag" $manifest_images
 
-              echo "✅ Created manifest: $tag"
+              echo "✅ Created manifest: $tag ($arch_summary)"
             fi
           done
 
-          echo "✅ All multi-arch manifests created and pushed successfully"
+          echo "✅ All manifests created and pushed successfully"
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
           REF_NAME: ${{ steps.check-container.outputs.ref-name }}
@@ -479,13 +534,27 @@ jobs:
       - name: Multi-arch manifest summary
         if: steps.check-container.outputs.exists == 'true'
         run: |
-          echo "✅ Successfully created multi-arch manifests:"
+          # Re-check architectures for summary
+          amd64_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-amd64"
+          arm64_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${REF_NAME}-arm64"
+
+          # Check available architectures
+          architectures=()
+          if docker buildx imagetools inspect "$amd64_image" >/dev/null 2>&1; then
+            architectures+=("linux/amd64")
+          fi
+          if docker buildx imagetools inspect "$arm64_image" >/dev/null 2>&1; then
+            architectures+=("linux/arm64")
+          fi
+
+          arch_list=$(IFS=', '; echo "${architectures[*]}")
+
+          echo "✅ Successfully created manifests:"
           echo "   📦 Container: ${{ matrix.container.name }}"
           echo "   🏷️  Version: ${{ matrix.container.full_version }}"
-          echo "   � Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
           echo "   🚀 Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
-          echo "   🏗️  Architectures: linux/amd64, linux/arm64"
-          echo "   🏷️  Multi-arch Tags (from metadata action):"
+          echo "   🏗️  Architectures: $arch_list"
+          echo "   🏷️  Tags (from metadata action):"
           echo "${TAGS}" | while IFS= read -r tag; do
             if [ -n "$tag" ]; then
               tag_part=$(echo "$tag" | sed 's/.*://')
@@ -494,6 +563,7 @@ jobs:
           done
         env:
           TAGS: ${{ steps.meta.outputs.tags }}
+          REF_NAME: ${{ steps.check-container.outputs.ref-name }}
 
   build-summary:
     runs-on: ubuntu-24.04
@@ -518,9 +588,9 @@ jobs:
 
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## 🏗️ Architecture Support" >> $GITHUB_STEP_SUMMARY
-          echo "- **Native AMD64 builds** on \`ubuntu-24.04\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Native ARM64 builds** on \`ubuntu-24.04-arm\`" >> $GITHUB_STEP_SUMMARY
-          echo "- **Multi-arch manifests** combining both architectures" >> $GITHUB_STEP_SUMMARY
+          echo "- **AMD64 builds** (required): Native builds on \`ubuntu-24.04\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **ARM64 builds** (optional): Native builds on \`ubuntu-24.04-arm\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Intelligent manifests**: Multi-arch when both succeed, single-arch when ARM64 fails" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "## Efficiency" >> $GITHUB_STEP_SUMMARY
           echo "- **Smart building**: Only builds containers that have changed" >> $GITHUB_STEP_SUMMARY
