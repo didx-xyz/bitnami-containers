@@ -113,8 +113,11 @@ jobs:
 
           # Extract container names and versions from commit messages
           # Pattern: [bitnami/CONTAINER_NAME] Release VERSION-OS_VARIANT-rREVISION
-          containers=()
 
+          # Use associative arrays to track the latest revision for each container+version combination
+          declare -A latest_releases
+
+          # First pass: find the latest revision for each container+version combination
           while IFS= read -r commit_line; do
             if [ -n "$commit_line" ]; then
               # Extract container name from commit message: [bitnami/CONTAINER_NAME] -> CONTAINER_NAME
@@ -124,65 +127,98 @@ jobs:
               full_release=$(echo "$commit_line" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
 
               if [ -n "$container_name" ] && [ -n "$full_release" ]; then
-                echo "Found changed container from commit: $container_name -> $full_release"
-
                 # Parse the release string to extract version and OS variant
-                # Example: 1.18.1-debian-12-r0 -> version=1.18.1, os_variant=debian-12, revision=r0
                 if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
                   version="${BASH_REMATCH[1]}"
                   os_variant="${BASH_REMATCH[2]}"
                   revision="${BASH_REMATCH[3]}"
+                  revision_num=$(echo "$revision" | sed 's/r//')
 
-                  # Parse semantic version components
-                  major_version=$(echo "$version" | cut -d. -f1)
-                  minor_version=$(echo "$version" | cut -d. -f1-2)
-                  patch_version="$version"
+                  # Create a key for this container+version+os combination
+                  key="${container_name}:${version}-${os_variant}"
 
-                  echo "Parsed: version=$version, os_variant=$os_variant, revision=$revision"
-                  echo "Semantic versions: major=$major_version, minor=$minor_version, patch=$patch_version"
-
-                  # Find the matching container directory
-                  # Look for bitnami/CONTAINER_NAME/MAJOR_VERSION/OS_VARIANT/Dockerfile
-                  container_dir="bitnami/$container_name/$major_version/$os_variant"
-
-                  if [ -f "$container_dir/Dockerfile" ]; then
-                    # Create container object with full version info
-                    container_obj=$(jq -n \
-                      --arg name "$container_name" \
-                      --arg version "$version" \
-                      --arg major_version "$major_version" \
-                      --arg minor_version "$minor_version" \
-                      --arg patch_version "$patch_version" \
-                      --arg os_variant "$os_variant" \
-                      --arg revision "$revision" \
-                      --arg full_version "$version-$os_variant-$revision" \
-                      --arg dockerfile "$container_dir/Dockerfile" \
-                      --arg context "$container_dir" \
-                      '{
-                        name: $name,
-                        version: $version,
-                        major_version: $major_version,
-                        minor_version: $minor_version,
-                        patch_version: $patch_version,
-                        os_variant: $os_variant,
-                        revision: $revision,
-                        full_version: $full_version,
-                        dockerfile: $dockerfile,
-                        context: $context,
-                        tag: ($name + ":" + $full_version)
-                      }')
-
-                    containers+=("$container_obj")
-                    echo "Added container: $container_name:$version-$os_variant-$revision"
+                  # Check if this is the latest revision for this combination
+                  if [ -z "${latest_releases[$key]}" ]; then
+                    latest_releases[$key]="$full_release:$revision_num"
+                    echo "Initial release for $key: $full_release"
                   else
-                    echo "Warning: Dockerfile not found at $container_dir/Dockerfile"
+                    current_revision=$(echo "${latest_releases[$key]}" | cut -d: -f2)
+                    if [ "$revision_num" -gt "$current_revision" ]; then
+                      latest_releases[$key]="$full_release:$revision_num"
+                      echo "Updated latest release for $key: $full_release (was r$current_revision, now r$revision_num)"
+                    else
+                      echo "Skipping older release for $key: $full_release (latest is r$current_revision)"
+                    fi
                   fi
-                else
-                  echo "Warning: Could not parse release format: $full_release"
                 fi
               fi
             fi
           done <<< "$commit_messages"
+
+          # Second pass: build containers only for the latest revisions
+          containers=()
+
+          for key in "${!latest_releases[@]}"; do
+            full_release=$(echo "${latest_releases[$key]}" | cut -d: -f1)
+            container_name=$(echo "$key" | cut -d: -f1)
+            version_os=$(echo "$key" | cut -d: -f2)
+
+            echo "Building latest release for $container_name: $full_release"
+
+            # Parse the release string again to extract components
+            if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
+              version="${BASH_REMATCH[1]}"
+              os_variant="${BASH_REMATCH[2]}"
+              revision="${BASH_REMATCH[3]}"
+
+              # Parse semantic version components
+              major_version=$(echo "$version" | cut -d. -f1)
+              minor_version=$(echo "$version" | cut -d. -f1-2)
+              patch_version="$version"
+
+              echo "Parsed: version=$version, os_variant=$os_variant, revision=$revision"
+              echo "Semantic versions: major=$major_version, minor=$minor_version, patch=$patch_version"
+
+              # Find the matching container directory
+              # Look for bitnami/CONTAINER_NAME/MAJOR_VERSION/OS_VARIANT/Dockerfile
+              container_dir="bitnami/$container_name/$major_version/$os_variant"
+
+              if [ -f "$container_dir/Dockerfile" ]; then
+                # Create container object with full version info
+                container_obj=$(jq -n \
+                  --arg name "$container_name" \
+                  --arg version "$version" \
+                  --arg major_version "$major_version" \
+                  --arg minor_version "$minor_version" \
+                  --arg patch_version "$patch_version" \
+                  --arg os_variant "$os_variant" \
+                  --arg revision "$revision" \
+                  --arg full_version "$version-$os_variant-$revision" \
+                  --arg dockerfile "$container_dir/Dockerfile" \
+                  --arg context "$container_dir" \
+                  '{
+                    name: $name,
+                    version: $version,
+                    major_version: $major_version,
+                    minor_version: $minor_version,
+                    patch_version: $patch_version,
+                    os_variant: $os_variant,
+                    revision: $revision,
+                    full_version: $full_version,
+                    dockerfile: $dockerfile,
+                    context: $context,
+                    tag: ($name + ":" + $full_version)
+                  }')
+
+                containers+=("$container_obj")
+                echo "Added container: $container_name:$version-$os_variant-$revision"
+              else
+                echo "Warning: Dockerfile not found at $container_dir/Dockerfile"
+              fi
+            else
+              echo "Warning: Could not parse release format: $full_release"
+            fi
+          done
 
           # Convert to JSON array
           if [ ${#containers[@]} -eq 0 ]; then
