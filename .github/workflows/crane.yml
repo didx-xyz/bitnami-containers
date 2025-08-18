@@ -1,0 +1,70 @@
+name: Copy tags from docker.io/bitnamilegacy to GHCR
+
+on:
+  workflow_dispatch:
+    inputs:
+      containers:
+        description: "Comma-separated list of container names to sync (e.g: keycloak, nats, valkey)"
+        required: true
+        type: string
+
+permissions: {}
+
+jobs:
+  generate-matrix:
+    name: Generate matrix
+    runs-on: ubuntu-24.04
+    outputs:
+      matrix: ${{ steps.generate-matrix.outputs.matrix }}
+    steps:
+      - name: Generate matrix
+        id: generate-matrix
+        env:
+          CONTAINERS_INPUT: ${{ github.event.inputs.containers }}
+        run: |
+          # Parse comma-separated input into array
+          containers_input="${CONTAINERS_INPUT}"
+          echo "Input containers: $containers_input"
+
+          # Convert comma-separated string to JSON array
+          # Remove spaces around commas and convert to JSON
+          containers_json=$(echo "$containers_input" | sed 's/[[:space:]]*,[[:space:]]*/\n/g' | sed 's/^[[:space:]]*//; s/[[:space:]]*$//' | jq -R -s -c 'split("\n") | map(select(length > 0)) | map({"image": .})')
+
+          echo "Generated matrix JSON: '$containers_json'"
+
+          echo "matrix=$containers_json" >> $GITHUB_OUTPUT
+
+  crane:
+    name: Copy ${{ matrix.image }} tags
+    runs-on: ubuntu-24.04
+    needs: generate-matrix
+    permissions:
+      packages: write
+    strategy:
+      fail-fast: false
+      max-parallel: 5
+      matrix:
+        # Matrix is generated dynamically from user input
+        # Example: [{"image": "keycloak"}, {"image": "nats"}, {"image": "valkey"}]
+        include: ${{ fromJson(needs.generate-matrix.outputs.matrix) }}
+    steps:
+      - uses: docker/login-action@184bdaa0721073962dff0199f1fb9940f07167d1 # v3.5.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+      - uses: actions/setup-go@d35c59abb061a4a6fb18e82ac0862c26744d6ab5 # v5.5.0
+      - uses: imjasonh/setup-crane@31b88efe9de28ae0ffa220711af4b60be9435f6e # v0.4
+      - name: Copy ${{ matrix.image }} tags
+        run: |-
+          tags=$(crane ls docker.io/bitnamilegacy/${{ matrix.image }})
+          if [ -z "$tags" ]; then
+            echo "No tags found for ${{ matrix.image }}"
+            exit 1
+          fi
+          for tag in $tags; do
+            echo "Syncing docker.io/bitnamilegacy/${{ matrix.image }}:${tag}"
+            crane copy \
+              docker.io/bitnamilegacy/${{ matrix.image }}:${tag} \
+              ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.image }}:${tag}
+          done
