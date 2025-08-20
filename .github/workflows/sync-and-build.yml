@@ -6,6 +6,12 @@ on:
     - cron: "0 0 * * *"
   # Allow manual trigger
   workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: 'Upstream commit hash or ref to sync to (leave empty for latest main)'
+        required: false
+        type: string
+        default: ''
 
 permissions: {}
 
@@ -41,34 +47,45 @@ jobs:
 
       - name: Sync with upstream
         id: sync
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref }}
         run: |
-          # Fetch upstream changes
-          git fetch upstream main
+          # Determine target ref and fetch appropriate upstream changes
+          if [ -n "${UPSTREAM_REF}" ]; then
+            echo "Using specified upstream ref: ${UPSTREAM_REF}"
+            git fetch upstream "${UPSTREAM_REF}" || git fetch upstream
+            target_ref="${UPSTREAM_REF}"
+          else
+            echo "Using latest upstream main"
+            git fetch upstream main
+            target_ref="upstream/main"
+          fi
 
           # Check if there are any new commits
           LOCAL=$(git rev-parse HEAD)
-          UPSTREAM=$(git rev-parse upstream/main)
+          UPSTREAM=$(git rev-parse "$target_ref")
 
           echo "Local commit: $LOCAL"
-          echo "Upstream commit: $UPSTREAM"
+          echo "Target upstream commit: $UPSTREAM"
+          echo "Target ref: $target_ref"
 
           # Output the commit hashes for use in later jobs
           echo "local-commit=$LOCAL" >> $GITHUB_OUTPUT
           echo "upstream-commit=$UPSTREAM" >> $GITHUB_OUTPUT
 
           if [ "$LOCAL" != "$UPSTREAM" ]; then
-            echo "Changes detected, syncing..."
+            echo "Changes detected, syncing to $target_ref..."
 
-            # Reset main branch to match upstream exactly (preserving authorship)
-            git reset --hard upstream/main
+            # Reset main branch to match target exactly (preserving authorship)
+            git reset --hard "$UPSTREAM"
 
             # Push changes to origin main
             git push origin main --force-with-lease
 
             echo "has-changes=true" >> $GITHUB_OUTPUT
-            echo "Successfully synced with upstream preserving authorship"
+            echo "Successfully synced with $target_ref preserving authorship"
           else
-            echo "No changes detected"
+            echo "No changes detected - already at target commit"
             echo "has-changes=false" >> $GITHUB_OUTPUT
           fi
 
