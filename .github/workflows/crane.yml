@@ -65,7 +65,5 @@ jobs:
           IMAGE: ${{ matrix.image }}
           REPO: ${{ github.event.inputs.legacy == 'true' && 'docker.io/bitnamilegacy' || 'docker.io/bitnami' }}
         run: |-
-          for tag in $(crane ls ${REPO}/${IMAGE}); do
-            crane copy ${REPO}/${IMAGE}:${tag} \
-              ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.image }}:$tag || echo "::warning::Failed to copy ${REPO}/${IMAGE}:${tag}"
-          done
+          crane ls ${REPO}/${IMAGE} | parallel --will-cite -j4 --no-run-if-empty \
+            'crane copy ${REPO}/${IMAGE}:{} ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.image }}:{} || echo "::warning::Failed to copy ${REPO}/${IMAGE}:{}"'
