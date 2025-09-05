@@ -66,4 +66,4 @@ jobs:
           REPO: ${{ github.event.inputs.legacy == 'true' && 'docker.io/bitnamilegacy' || 'docker.io/bitnami' }}
         run: |-
           crane ls ${REPO}/${IMAGE} | grep -v '^sha256-' | parallel --will-cite -j4 --no-run-if-empty \
-            'crane copy ${REPO}/${IMAGE}:{} ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.image }}:{} || echo "::warning::Failed to copy ${REPO}/${IMAGE}:{}"'
+            'crane copy --no-clobber ${REPO}/${IMAGE}:{} ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.image }}:{} || echo "::warning::Failed to copy ${REPO}/${IMAGE}:{}"'
