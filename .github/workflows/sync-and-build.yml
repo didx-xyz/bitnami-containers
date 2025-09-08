@@ -116,106 +116,85 @@ jobs:
         run: |
           echo "Comparing commits: $BASE_COMMIT..$TARGET_COMMIT"
 
-          # Get bitnami container commits
-          commit_messages=$(git log "${BASE_COMMIT}..${TARGET_COMMIT}" --pretty=format:"%s" | grep "^\[bitnami/" || true)
+          # Get bitnami container commits with their hashes
+          commit_data=$(git log "${BASE_COMMIT}..${TARGET_COMMIT}" --pretty=format:'%H %s' --no-decorate | grep " \[bitnami/" || true)
 
-          if [ -z "$commit_messages" ]; then
+          if [ -z "$commit_data" ]; then
             echo "No bitnami container commits detected"
             echo "containers-count=0" >> $GITHUB_OUTPUT
             echo "matrix=[]" >> $GITHUB_OUTPUT
             exit 0
           fi
 
-          echo "Bitnami container commits:"
-          echo "$commit_messages"
+          echo "Bitnami container commits with hashes:"
+          echo "$commit_data"
 
-          # Track latest revisions for each container+version combination
-          declare -A latest_releases
+          # Build container matrix - no deduplication, include all commits
+          containers=()
 
           while IFS= read -r commit_line; do
             if [ -n "$commit_line" ]; then
+              # Extract commit hash and message
+              commit_hash=$(echo "$commit_line" | cut -d' ' -f1)
+              commit_msg=$(echo "$commit_line" | cut -d' ' -f2-)
+
               # Extract: [bitnami/CONTAINER] Release VERSION-OS-rREVISION
-              container_name=$(echo "$commit_line" | grep -oE '\[bitnami/[^]]+\]' | sed 's/\[bitnami\/\([^]]*\)\]/\1/')
-              full_release=$(echo "$commit_line" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
+              container_name=$(echo "$commit_msg" | grep -oE '\[bitnami/[^]]+\]' | sed 's/\[bitnami\/\([^]]*\)\]/\1/')
+              full_release=$(echo "$commit_msg" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
 
               if [ -n "$container_name" ] && [ -n "$full_release" ]; then
                 if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
                   version="${BASH_REMATCH[1]}"
                   os_variant="${BASH_REMATCH[2]}"
                   revision="${BASH_REMATCH[3]}"
-                  revision_num=$(echo "$revision" | sed 's/r//')
 
-                  key="${container_name}:${version}-${os_variant}"
+                  major_version=$(echo "$version" | cut -d. -f1)
+                  minor_version=$(echo "$version" | cut -d. -f1-2)
 
-                  # Keep only the latest revision
-                  if [ -z "${latest_releases[$key]}" ]; then
-                    latest_releases[$key]="$full_release:$revision_num"
-                  else
-                    current_revision=$(echo "${latest_releases[$key]}" | cut -d: -f2)
-                    if [ "$revision_num" -gt "$current_revision" ]; then
-                      latest_releases[$key]="$full_release:$revision_num"
+                  # Find container directory
+                  container_dir=""
+                  for dir_version in "$minor_version" "$major_version"; do
+                    if [ -d "bitnami/$container_name/$dir_version/$os_variant" ]; then
+                      container_dir="bitnami/$container_name/$dir_version/$os_variant"
+                      break
                     fi
+                  done
+
+                  if [ -n "$container_dir" ] && [ -f "$container_dir/Dockerfile" ]; then
+                    container_obj=$(jq -n \
+                      --arg name "$container_name" \
+                      --arg version "$version" \
+                      --arg major_version "$major_version" \
+                      --arg minor_version "$minor_version" \
+                      --arg patch_version "$version" \
+                      --arg os_variant "$os_variant" \
+                      --arg revision "$revision" \
+                      --arg full_version "$version-$os_variant-$revision" \
+                      --arg dockerfile "$container_dir/Dockerfile" \
+                      --arg context "$container_dir" \
+                      --arg commit_hash "$commit_hash" \
+                      '{
+                        name: $name,
+                        version: $version,
+                        major_version: $major_version,
+                        minor_version: $minor_version,
+                        patch_version: $patch_version,
+                        os_variant: $os_variant,
+                        revision: $revision,
+                        full_version: $full_version,
+                        dockerfile: $dockerfile,
+                        context: $context,
+                        commit_hash: $commit_hash,
+                        tag: ($name + ":" + $full_version)
+                      }')
+
+                    containers+=("$container_obj")
+                    echo "Added container: $container_name:$version-$os_variant-$revision (commit: $commit_hash)"
                   fi
                 fi
               fi
             fi
-          done <<< "$commit_messages"
-
-          # Build container matrix
-          containers=()
-
-          for key in "${!latest_releases[@]}"; do
-            full_release=$(echo "${latest_releases[$key]}" | cut -d: -f1)
-            container_name=$(echo "$key" | cut -d: -f1)
-
-            if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
-              version="${BASH_REMATCH[1]}"
-              os_variant="${BASH_REMATCH[2]}"
-              revision="${BASH_REMATCH[3]}"
-
-              major_version=$(echo "$version" | cut -d. -f1)
-              minor_version=$(echo "$version" | cut -d. -f1-2)
-
-              # Find container directory
-              container_dir=""
-              for dir_version in "$minor_version" "$major_version"; do
-                if [ -d "bitnami/$container_name/$dir_version/$os_variant" ]; then
-                  container_dir="bitnami/$container_name/$dir_version/$os_variant"
-                  break
-                fi
-              done
-
-              if [ -n "$container_dir" ] && [ -f "$container_dir/Dockerfile" ]; then
-                container_obj=$(jq -n \
-                  --arg name "$container_name" \
-                  --arg version "$version" \
-                  --arg major_version "$major_version" \
-                  --arg minor_version "$minor_version" \
-                  --arg patch_version "$version" \
-                  --arg os_variant "$os_variant" \
-                  --arg revision "$revision" \
-                  --arg full_version "$version-$os_variant-$revision" \
-                  --arg dockerfile "$container_dir/Dockerfile" \
-                  --arg context "$container_dir" \
-                  '{
-                    name: $name,
-                    version: $version,
-                    major_version: $major_version,
-                    minor_version: $minor_version,
-                    patch_version: $patch_version,
-                    os_variant: $os_variant,
-                    revision: $revision,
-                    full_version: $full_version,
-                    dockerfile: $dockerfile,
-                    context: $context,
-                    tag: ($name + ":" + $full_version)
-                  }')
-
-                containers+=("$container_obj")
-                echo "Added container: $container_name:$version-$os_variant-$revision"
-              fi
-            fi
-          done
+          done <<< "$commit_data"
 
           # Output results
           if [ ${#containers[@]} -eq 0 ]; then
@@ -260,7 +239,7 @@ jobs:
       - name: Checkout repository
         uses: actions/checkout@08c6903cd8c0fde910a37f88322edcfb5dd907a8 # v5.0.0
         with:
-          ref: main
+          ref: ${{ matrix.container.commit_hash }}
           persist-credentials: false
 
       - name: Check if ARM64 build should be skipped
