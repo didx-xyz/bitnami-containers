@@ -143,7 +143,7 @@ jobs:
               full_release=$(echo "$commit_msg" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
 
               if [ -n "$container_name" ] && [ -n "$full_release" ]; then
-                if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
+                if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+.*)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
                   version="${BASH_REMATCH[1]}"
                   os_variant="${BASH_REMATCH[2]}"
                   revision="${BASH_REMATCH[3]}"
