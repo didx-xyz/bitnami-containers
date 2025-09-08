@@ -76,16 +76,31 @@ jobs:
           echo "upstream-commit=$UPSTREAM" >> $GITHUB_OUTPUT
 
           if [ "$LOCAL" != "$UPSTREAM" ]; then
-            echo "Changes detected, syncing to $target_ref..."
+            echo "Changes detected, checking commit count..."
 
-            # Reset main branch to match target exactly (preserving authorship)
-            git reset --hard "$UPSTREAM"
+            # Count commits between local and upstream
+            commit_count=$(git rev-list --count "${LOCAL}...${UPSTREAM}")
+            echo "Found $commit_count commits to sync"
+
+            if [ "$commit_count" -le 50 ]; then
+              echo "Syncing all $commit_count commits to $target_ref..."
+              sync_target="$UPSTREAM"
+            else
+              echo "⚠️ Too many commits ($commit_count). Limiting to first 50 commits."
+              # Get the 50th commit chronologically forward (reverse the list first)
+              sync_target=$(git rev-list --reverse "${LOCAL}...${UPSTREAM}" | head -n 50 | tail -n 1)
+              echo "Syncing to commit: $sync_target"
+            fi
+
+            # Reset main branch to the determined target
+            git reset --hard "$sync_target"
 
             # Push changes to origin main
             git push origin main --force-with-lease
 
             echo "has-changes=true" >> $GITHUB_OUTPUT
-            echo "Successfully synced with $target_ref preserving authorship"
+            echo "upstream-commit=$sync_target" >> $GITHUB_OUTPUT
+            echo "Successfully synced to commit: $sync_target"
           else
             echo "No changes detected - already at target commit"
             echo "has-changes=false" >> $GITHUB_OUTPUT
