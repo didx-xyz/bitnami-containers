@@ -153,7 +153,7 @@ jobs:
 
                   # Find container directory
                   container_dir=""
-                  for dir_version in "$minor_version" "$major_version"; do
+                  for dir_version in "$minor_version" "$major_version" "$version"; do
                     if [ -d "bitnami/$container_name/$dir_version/$os_variant" ]; then
                       container_dir="bitnami/$container_name/$dir_version/$os_variant"
                       break
