@@ -244,19 +244,44 @@ jobs:
 
       - name: Check if ARM64 build should be skipped
         id: skip-check
+        env:
+          ARM64_EXCLUDED_CONTAINERS: pymilvus
         run: |
           arch="${{ matrix.arch }}"
 
           if [ "$arch" = "arm64" ]; then
-            vib_file=".vib/${{ matrix.container.name }}/vib-verify.json"
+            # Check if container is in the exclusion list
+            container_name="${{ matrix.container.name }}"
+            excluded_containers="$ARM64_EXCLUDED_CONTAINERS"
 
-            if [ -f "$vib_file" ] && jq -e '.phases.package.actions[0].params.architectures[]? | select(. == "linux/arm64")' "$vib_file" >/dev/null 2>&1; then
-              echo "✅ ARM64 build allowed for ${{ matrix.container.name }}"
-              echo "should-skip=false" >> $GITHUB_OUTPUT
-            else
-              echo "🚫 Skipping ARM64 build for ${{ matrix.container.name }} (not supported in vib-verify.json)"
-              echo "::notice::ARM64 build skipped for ${{ matrix.container.name }} (architecture not supported)"
+            # Convert comma-separated list to array and check if container is excluded
+            IFS=',' read -ra EXCLUDED_ARRAY <<< "$excluded_containers"
+            is_excluded=false
+
+            for excluded in "${EXCLUDED_ARRAY[@]}"; do
+              # Trim whitespace
+              excluded=$(echo "$excluded" | xargs)
+              if [ "$container_name" = "$excluded" ]; then
+                is_excluded=true
+                break
+              fi
+            done
+
+            if [ "$is_excluded" = "true" ]; then
+              echo "🚫 Skipping ARM64 build for $container_name (explicitly excluded)"
+              echo "::notice::ARM64 build skipped for $container_name (explicitly excluded due to build issues)"
               echo "should-skip=true" >> $GITHUB_OUTPUT
+            else
+              vib_file=".vib/${{ matrix.container.name }}/vib-verify.json"
+
+              if [ -f "$vib_file" ] && jq -e '.phases.package.actions[0].params.architectures[]? | select(. == "linux/arm64")' "$vib_file" >/dev/null 2>&1; then
+                echo "✅ ARM64 build allowed for ${{ matrix.container.name }}"
+                echo "should-skip=false" >> $GITHUB_OUTPUT
+              else
+                echo "🚫 Skipping ARM64 build for ${{ matrix.container.name }} (not supported in vib-verify.json)"
+                echo "::notice::ARM64 build skipped for ${{ matrix.container.name }} (architecture not supported)"
+                echo "should-skip=true" >> $GITHUB_OUTPUT
+              fi
             fi
           else
             echo "should-skip=false" >> $GITHUB_OUTPUT
