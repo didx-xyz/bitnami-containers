@@ -200,7 +200,7 @@ jobs:
           if [ ${#containers[@]} -eq 0 ]; then
             matrix_json="[]"
           else
-            matrix_json=$(printf '%s\n' "${containers[@]}" | jq -s .)
+            matrix_json=$(printf '%s\n' "${containers[@]}" | jq -s 'sort_by(.name)')
           fi
 
           echo "Found ${#containers[@]} changed containers"
