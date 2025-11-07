@@ -143,13 +143,19 @@ jobs:
               full_release=$(echo "$commit_msg" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
 
               if [ -n "$container_name" ] && [ -n "$full_release" ]; then
-                if [[ "$full_release" =~ ^([0-9]+\.[0-9]+\.[0-9]+.*)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
+                # Match version formats: X, X.Y, or X.Y.Z (with optional additional parts)
+                if [[ "$full_release" =~ ^([0-9]+(\.[0-9]+)*.*)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
                   version="${BASH_REMATCH[1]}"
-                  os_variant="${BASH_REMATCH[2]}"
-                  revision="${BASH_REMATCH[3]}"
+                  os_variant="${BASH_REMATCH[3]}"
+                  revision="${BASH_REMATCH[4]}"
 
                   major_version=$(echo "$version" | cut -d. -f1)
-                  minor_version=$(echo "$version" | cut -d. -f1-2)
+                  # Handle single-number versions (like "12") where minor_version = major_version
+                  if [[ "$version" =~ \. ]]; then
+                    minor_version=$(echo "$version" | cut -d. -f1-2)
+                  else
+                    minor_version="$major_version"
+                  fi
 
                   # Find container directory
                   container_dir=""
