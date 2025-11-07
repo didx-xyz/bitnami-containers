@@ -242,6 +242,21 @@ jobs:
           ref: ${{ matrix.container.commit_hash }}
           persist-credentials: false
 
+      - name: Restore .vib directory from publish branch
+        run: |
+          # Fetch the publish branch to get .vib files
+          git fetch origin publish
+
+          # Checkout only the .vib directory from publish branch
+          git checkout origin/publish -- .vib/ 2>/dev/null || echo "⚠️ .vib directory not found in publish branch"
+
+          if [ -d .vib ]; then
+            echo "✅ Restored .vib directory from publish branch"
+            ls -la .vib/ | head -10
+          else
+            echo "⚠️ No .vib directory available"
+          fi
+
       - name: Check if ARM64 build should be skipped
         id: skip-check
         env:
