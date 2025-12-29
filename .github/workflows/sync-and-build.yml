@@ -320,7 +320,6 @@ jobs:
         with:
           version: v0.29.1
           cache-binary: false
-          install: true
 
       - name: Log in to GitHub Container Registry
         if: steps.skip-check.outputs.should-skip == 'false'
@@ -426,7 +425,6 @@ jobs:
         with:
           version: v0.29.1
           cache-binary: false
-          install: true
 
       - name: Check if Dockerfile exists and get ref name
         id: check-dockerfile
