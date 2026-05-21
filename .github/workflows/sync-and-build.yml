@@ -1,0 +1,647 @@
+name: Sync and Build Containers
+
+on:
+  # Run daily at midnight UTC
+  schedule:
+    - cron: "0 0 * * *"
+  # Allow manual trigger
+  workflow_dispatch:
+    inputs:
+      upstream_ref:
+        description: "Upstream commit hash or ref to sync to (leave empty for latest main)"
+        required: false
+        type: string
+        default: ""
+
+permissions: {}
+
+# Prevent concurrent runs
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  ## Always automatically keep `main` in sync with `upstream/main`
+  sync-upstream:
+    runs-on: ubuntu-24.04
+    name: Sync with upstream
+    outputs:
+      has-changes: ${{ steps.sync.outputs.has-changes }}
+      local-commit: ${{ steps.sync.outputs.local-commit }}
+      upstream-commit: ${{ steps.sync.outputs.upstream-commit }}
+      matrix: ${{ steps.sync.outputs.has-changes == 'true' && steps.discover.outputs.matrix || '[]' }}
+      containers-count: ${{ steps.sync.outputs.has-changes == 'true' && steps.discover.outputs.containers-count || '0' }}
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 1
+          persist-credentials: true
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/bitnami/containers.git || true
+          git remote set-url upstream https://github.com/bitnami/containers.git
+
+      - name: Sync with upstream
+        id: sync
+        env:
+          UPSTREAM_REF: ${{ github.event.inputs.upstream_ref }}
+        run: |
+          # Determine target ref and fetch appropriate upstream changes
+          if [ -n "${UPSTREAM_REF}" ]; then
+            echo "Using specified upstream ref: ${UPSTREAM_REF}"
+            git fetch upstream "${UPSTREAM_REF}" || git fetch upstream
+            target_ref="${UPSTREAM_REF}"
+          else
+            echo "Using latest upstream main"
+            git fetch upstream main
+            target_ref="upstream/main"
+          fi
+
+          # Check if there are any new commits
+          LOCAL=$(git rev-parse HEAD)
+          UPSTREAM=$(git rev-parse "$target_ref")
+
+          echo "Local commit: $LOCAL"
+          echo "Target upstream commit: $UPSTREAM"
+          echo "Target ref: $target_ref"
+
+          # Output the commit hashes for use in later jobs
+          echo "local-commit=$LOCAL" >> $GITHUB_OUTPUT
+          echo "upstream-commit=$UPSTREAM" >> $GITHUB_OUTPUT
+
+          if [ "$LOCAL" != "$UPSTREAM" ]; then
+            echo "Changes detected, checking commit count..."
+
+            # Count commits between local and upstream
+            commit_count=$(git rev-list --count "${LOCAL}...${UPSTREAM}")
+            echo "Found $commit_count commits to sync"
+
+            if [ "$commit_count" -le 50 ]; then
+              echo "Syncing all $commit_count commits to $target_ref..."
+              sync_target="$UPSTREAM"
+            else
+              echo "⚠️ Too many commits ($commit_count). Limiting to first 50 commits."
+              # Get the 50th commit chronologically forward (reverse the list first)
+              sync_target=$(git rev-list --reverse "${LOCAL}...${UPSTREAM}" | head -n 50 | tail -n 1)
+              echo "Syncing to commit: $sync_target"
+            fi
+
+            # Reset main branch to the determined target
+            git reset --hard "$sync_target"
+
+            # Push changes to origin main
+            git push origin main --force-with-lease
+
+            echo "has-changes=true" >> $GITHUB_OUTPUT
+            echo "upstream-commit=$sync_target" >> $GITHUB_OUTPUT
+            echo "Successfully synced to commit: $sync_target"
+          else
+            echo "No changes detected - already at target commit"
+            echo "has-changes=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Unshallow repository
+        run: git fetch --all --unshallow
+        if: steps.sync.outputs.has-changes == 'true'
+
+      - name: Discover changed containers
+        id: discover
+        if: steps.sync.outputs.has-changes == 'true'
+        run: |
+          echo "Comparing commits: $BASE_COMMIT..$TARGET_COMMIT"
+
+          # Get bitnami container commits with their hashes
+          commit_data=$(git log "${BASE_COMMIT}..${TARGET_COMMIT}" --pretty=format:'%H %s' --no-decorate | grep " \[bitnami/" || true)
+
+          if [ -z "$commit_data" ]; then
+            echo "No bitnami container commits detected"
+            echo "containers-count=0" >> $GITHUB_OUTPUT
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            exit 0
+          fi
+
+          echo "Bitnami container commits with hashes:"
+          echo "$commit_data"
+
+          # Build container matrix - no deduplication, include all commits
+          containers=()
+
+          while IFS= read -r commit_line; do
+            if [ -n "$commit_line" ]; then
+              # Extract commit hash and message
+              commit_hash=$(echo "$commit_line" | cut -d' ' -f1)
+              commit_msg=$(echo "$commit_line" | cut -d' ' -f2-)
+
+              # Extract: [bitnami/CONTAINER] Release VERSION-OS-rREVISION
+              container_name=$(echo "$commit_msg" | grep -oE '\[bitnami/[^]]+\]' | sed 's/\[bitnami\/\([^]]*\)\]/\1/')
+              full_release=$(echo "$commit_msg" | grep -oE 'Release [^[:space:]]+' | sed 's/Release //')
+
+              if [ -n "$container_name" ] && [ -n "$full_release" ]; then
+                # Match version formats: X, X.Y, or X.Y.Z (with optional additional parts)
+                if [[ "$full_release" =~ ^([0-9]+(\.[0-9]+)*.*)-([^-]+-[0-9]+)-(r[0-9]+)$ ]]; then
+                  version="${BASH_REMATCH[1]}"
+                  os_variant="${BASH_REMATCH[3]}"
+                  revision="${BASH_REMATCH[4]}"
+
+                  major_version=$(echo "$version" | cut -d. -f1)
+                  # Handle single-number versions (like "12") where minor_version = major_version
+                  if [[ "$version" =~ \. ]]; then
+                    minor_version=$(echo "$version" | cut -d. -f1-2)
+                  else
+                    minor_version="$major_version"
+                  fi
+
+                  # Find container directory
+                  container_dir=""
+                  for dir_version in "$minor_version" "$major_version" "$version"; do
+                    if [ -d "bitnami/$container_name/$dir_version/$os_variant" ]; then
+                      container_dir="bitnami/$container_name/$dir_version/$os_variant"
+                      break
+                    fi
+                  done
+
+                  if [ -n "$container_dir" ] && [ -f "$container_dir/Dockerfile" ]; then
+                    container_obj=$(jq -n \
+                      --arg name "$container_name" \
+                      --arg version "$version" \
+                      --arg major_version "$major_version" \
+                      --arg minor_version "$minor_version" \
+                      --arg patch_version "$version" \
+                      --arg os_variant "$os_variant" \
+                      --arg revision "$revision" \
+                      --arg full_version "$version-$os_variant-$revision" \
+                      --arg dockerfile "$container_dir/Dockerfile" \
+                      --arg context "$container_dir" \
+                      --arg commit_hash "$commit_hash" \
+                      '{
+                        name: $name,
+                        version: $version,
+                        major_version: $major_version,
+                        minor_version: $minor_version,
+                        patch_version: $patch_version,
+                        os_variant: $os_variant,
+                        revision: $revision,
+                        full_version: $full_version,
+                        dockerfile: $dockerfile,
+                        context: $context,
+                        commit_hash: $commit_hash,
+                        tag: ($name + ":" + $full_version)
+                      }')
+
+                    containers+=("$container_obj")
+                    echo "Added container: $container_name:$version-$os_variant-$revision (commit: $commit_hash)"
+                  fi
+                fi
+              fi
+            fi
+          done <<< "$commit_data"
+
+          # Output results
+          if [ ${#containers[@]} -eq 0 ]; then
+            matrix_json="[]"
+          else
+            matrix_json=$(printf '%s\n' "${containers[@]}" | jq -s 'sort_by(.name)')
+          fi
+
+          echo "Found ${#containers[@]} changed containers"
+          echo "containers-count=${#containers[@]}" >> $GITHUB_OUTPUT
+
+          echo "$matrix_json" > /tmp/matrix.json
+          echo "matrix<<EOF" >> $GITHUB_OUTPUT
+          cat /tmp/matrix.json >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+        env:
+          BASE_COMMIT: ${{ steps.sync.outputs.local-commit }}
+          TARGET_COMMIT: ${{ steps.sync.outputs.upstream-commit }}
+
+  build:
+    name: Build ${{ matrix.container.name }} (${{ matrix.arch }})
+    runs-on: ${{ matrix.runs-on }}
+    needs: sync-upstream
+    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.sync-upstream.outputs.containers-count != '0'
+    strategy:
+      fail-fast: true
+      max-parallel: 10
+      matrix:
+        container: ${{ fromJSON(needs.sync-upstream.outputs.matrix) }}
+        arch: [amd64, arm64]
+        include:
+          - arch: amd64
+            runs-on: ubuntu-24.04
+          - arch: arm64
+            runs-on: ubuntu-24.04-arm
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: ${{ matrix.container.commit_hash }}
+          persist-credentials: false
+
+      - name: Restore .vib directory from publish branch
+        run: |
+          # Fetch the publish branch to get .vib files
+          git fetch origin publish
+
+          # Checkout only the .vib directory from publish branch
+          git checkout origin/publish -- .vib/ 2>/dev/null || echo "⚠️ .vib directory not found in publish branch"
+
+          if [ -d .vib ]; then
+            echo "✅ Restored .vib directory from publish branch"
+            ls -la .vib/ | head -10
+          else
+            echo "⚠️ No .vib directory available"
+          fi
+
+      - name: Check if ARM64 build should be skipped
+        id: skip-check
+        env:
+          ARM64_EXCLUDED_CONTAINERS: pymilvus
+        run: |
+          arch="${{ matrix.arch }}"
+
+          if [ "$arch" = "arm64" ]; then
+            # Check if container is in the exclusion list
+            container_name="${{ matrix.container.name }}"
+            excluded_containers="$ARM64_EXCLUDED_CONTAINERS"
+
+            # Convert comma-separated list to array and check if container is excluded
+            IFS=',' read -ra EXCLUDED_ARRAY <<< "$excluded_containers"
+            is_excluded=false
+
+            for excluded in "${EXCLUDED_ARRAY[@]}"; do
+              # Trim whitespace
+              excluded=$(echo "$excluded" | xargs)
+              if [ "$container_name" = "$excluded" ]; then
+                is_excluded=true
+                break
+              fi
+            done
+
+            if [ "$is_excluded" = "true" ]; then
+              echo "🚫 Skipping ARM64 build for $container_name (explicitly excluded)"
+              echo "::notice::ARM64 build skipped for $container_name (explicitly excluded due to build issues)"
+              echo "should-skip=true" >> $GITHUB_OUTPUT
+            else
+              vib_file=".vib/${{ matrix.container.name }}/vib-verify.json"
+
+              if [ -f "$vib_file" ] && jq -e '.phases.package.actions[0].params.architectures[]? | select(. == "linux/arm64")' "$vib_file" >/dev/null 2>&1; then
+                echo "✅ ARM64 build allowed for ${{ matrix.container.name }}"
+                echo "should-skip=false" >> $GITHUB_OUTPUT
+              else
+                echo "🚫 Skipping ARM64 build for ${{ matrix.container.name }} (not supported in vib-verify.json)"
+                echo "::notice::ARM64 build skipped for ${{ matrix.container.name }} (architecture not supported)"
+                echo "should-skip=true" >> $GITHUB_OUTPUT
+              fi
+            fi
+          else
+            echo "should-skip=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: ARM64 build skipped
+        if: steps.skip-check.outputs.should-skip == 'true'
+        run: |
+          echo "⏭️ ARM64 build skipped for ${{ matrix.container.name }} (architecture not supported)"
+          echo "Container's .vib/vib-verify.json does not include linux/arm64 in supported architectures"
+
+      - name: Set up Docker Buildx
+        if: steps.skip-check.outputs.should-skip == 'false'
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          # https://github.com/docker/buildx
+          version: v0.34.1
+          cache-binary: false
+
+      - name: Log in to GitHub Container Registry
+        if: steps.skip-check.outputs.should-skip == 'false'
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Check if Dockerfile exists and get ref name
+        if: steps.skip-check.outputs.should-skip == 'false'
+        id: check-dockerfile
+        run: |
+          dockerfile_path="${{ matrix.container.dockerfile }}"
+
+          if [ -f "$dockerfile_path" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+
+            # Extract ref name from Dockerfile or use fallback
+            ref_name=$(grep -oE 'org\.opencontainers\.image\.ref\.name="[^"]*"' "$dockerfile_path" | sed 's/.*="\([^"]*\)"/\1/' || echo "")
+
+            if [ -n "$ref_name" ]; then
+              echo "ref-name=$ref_name" >> $GITHUB_OUTPUT
+            else
+              echo "ref-name=${{ matrix.container.version }}-${{ matrix.container.os_variant }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker Metadata
+        id: meta
+        if: steps.skip-check.outputs.should-skip == 'false' && steps.check-dockerfile.outputs.exists == 'true'
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}
+          tags: |
+            type=raw,value=${{ steps.check-dockerfile.outputs.ref-name }}-${{ matrix.arch }}
+            type=raw,value=${{ matrix.container.full_version }}-${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.title=${{ matrix.container.name }}
+            org.opencontainers.image.version=${{ matrix.container.full_version }}
+            org.opencontainers.image.revision=${{ github.sha }}
+            org.opencontainers.image.source=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.url=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.documentation=${{ github.server_url }}/${{ github.repository }}
+            org.opencontainers.image.vendor=${{ github.repository_owner }}
+            org.opencontainers.image.licenses=Apache-2.0
+            org.opencontainers.image.ref.name=${{ steps.check-dockerfile.outputs.ref-name }}
+            org.opencontainers.image.base.name=docker.io/bitnami/minideb
+            org.opencontainers.image.description=Unmodified redistribution of Bitnami ${{ matrix.container.name }} container
+            org.opencontainers.image.authors=Bitnami Engineering
+            maintainer=${{ github.repository_owner }}
+
+      - name: Build and push image
+        if: steps.skip-check.outputs.should-skip == 'false' && steps.check-dockerfile.outputs.exists == 'true'
+        uses: docker/build-push-action@f9f3042f7e2789586610d6e8b85c8f03e5195baf # v7.2.0
+        with:
+          context: ${{ matrix.container.context }}
+          file: ${{ matrix.container.dockerfile }}
+          platforms: linux/${{ matrix.arch }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha,scope=${{ matrix.container.name }}-${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.container.name }}-${{ matrix.arch }}
+          build-args: |
+            TARGETARCH=${{ matrix.arch }}
+
+      - name: Architecture build summary
+        if: steps.skip-check.outputs.should-skip == 'false' && steps.check-dockerfile.outputs.exists == 'true'
+        run: |
+          echo "✅ Successfully built and pushed ${{ matrix.arch }} image:"
+          echo "   📦 Container: ${{ matrix.container.name }}"
+          echo "   🏗️  Architecture: ${{ matrix.arch }}"
+          echo "   🏷️  Version: ${{ matrix.container.full_version }}"
+          echo "   🚀 Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
+
+  push-manifests:
+    name: Push
+    runs-on: ubuntu-24.04
+    needs: [sync-upstream, build]
+    if: needs.sync-upstream.outputs.has-changes == 'true' && needs.sync-upstream.outputs.containers-count != '0' && needs.build.result != 'cancelled'
+    strategy:
+      fail-fast: true
+      max-parallel: 10
+      matrix:
+        container: ${{ fromJSON(needs.sync-upstream.outputs.matrix) }}
+
+    permissions:
+      contents: read
+      packages: write
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          ref: main
+          persist-credentials: false
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@4d04d5d9486b7bd6fa91e7baf45bbb4f8b9deedd # v4.0.0
+        with:
+          # https://github.com/docker/buildx
+          version: v0.34.1
+          cache-binary: false
+
+      - name: Check if Dockerfile exists and get ref name
+        id: check-dockerfile
+        run: |
+          dockerfile_path="${{ matrix.container.dockerfile }}"
+
+          if [ -f "$dockerfile_path" ]; then
+            echo "exists=true" >> $GITHUB_OUTPUT
+
+            # Extract ref name from Dockerfile or use fallback
+            ref_name=$(grep -oE 'org\.opencontainers\.image\.ref\.name="[^"]*"' "$dockerfile_path" | sed 's/.*="\([^"]*\)"/\1/' || echo "")
+
+            if [ -n "$ref_name" ]; then
+              echo "ref-name=$ref_name" >> $GITHUB_OUTPUT
+            else
+              echo "ref-name=${{ matrix.container.full_version }}" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "exists=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Docker Metadata
+        id: meta
+        if: steps.check-dockerfile.outputs.exists == 'true'
+        uses: docker/metadata-action@030e881283bb7a6894de51c315a6bfe6a94e05cf # v6.0.0
+        with:
+          images: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}
+          tags: |
+            type=raw,value=${{ steps.check-dockerfile.outputs.ref-name }}
+            type=raw,value=${{ matrix.container.full_version }}
+            type=raw,value=${{ matrix.container.patch_version }}
+            type=raw,value=${{ matrix.container.minor_version }}
+            type=raw,value=${{ matrix.container.major_version }}
+            type=raw,value=${{ matrix.container.full_version }}-{{date 'YYYYMMDD'}}
+            type=raw,value=latest
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@4907a6ddec9925e35a0a9e82d7399ccc52663121 # v4.1.0
+        with:
+          registry: ghcr.io
+          username: ${{ github.repository_owner }}
+          password: ${{ github.token }}
+
+      - name: Create and push manifests
+        if: steps.check-dockerfile.outputs.exists == 'true'
+        run: |
+          # Check which architectures were successfully built
+          base_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
+          amd64_image="${base_image}:${{ steps.check-dockerfile.outputs.ref-name }}-amd64"
+          arm64_image="${base_image}:${{ steps.check-dockerfile.outputs.ref-name }}-arm64"
+
+          echo "Checking available architectures..."
+
+          # Check AMD64 availability (required)
+          if docker buildx imagetools inspect "$amd64_image" >/dev/null 2>&1; then
+            echo "✅ AMD64 image available"
+            manifest_images="$amd64_image"
+            arch_summary="linux/amd64"
+          else
+            echo "❌ CRITICAL: AMD64 image not available: $amd64_image"
+            exit 1
+          fi
+
+          # Check ARM64 availability (optional)
+          if docker buildx imagetools inspect "$arm64_image" >/dev/null 2>&1; then
+            echo "✅ ARM64 image available"
+            manifest_images="$manifest_images $arm64_image"
+            arch_summary="$arch_summary, linux/arm64"
+          else
+            echo "⚠️ ARM64 image not available (skipped during build)"
+          fi
+
+          # Create manifests for all tags
+          echo "Creating manifests with architectures: $arch_summary"
+
+          tags="${{ steps.meta.outputs.tags }}"
+          echo "$tags" | while IFS= read -r tag; do
+            if [ -n "$tag" ]; then
+              echo "Creating manifest: $tag"
+              docker buildx imagetools create -t "$tag" $manifest_images
+            fi
+          done
+
+          echo "✅ All manifests created successfully"
+
+      - name: Manifest creation summary
+        if: steps.check-dockerfile.outputs.exists == 'true'
+        run: |
+          # Inspect the final manifest to show actual architectures
+          manifest_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}:${{ steps.check-dockerfile.outputs.ref-name }}"
+
+          architectures=$(docker buildx imagetools inspect "$manifest_image" --format '{{range .Manifest.Manifests}}{{if ne .Platform.OS "unknown"}}{{.Platform.OS}}/{{.Platform.Architecture}} {{end}}{{end}}' | xargs | sed 's/ /, /g')
+
+          echo "✅ Successfully created manifests:"
+          echo "   📦 Container: ${{ matrix.container.name }}"
+          echo "   🏷️  Version: ${{ matrix.container.full_version }}"
+          echo "   🚀 Registry: ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
+          echo "   🏗️  Architectures: $architectures"
+
+  build-summary:
+    runs-on: ubuntu-24.04
+    name: Build Summary
+    needs: [sync-upstream, build, push-manifests]
+    if: always()
+    steps:
+      - name: Generate summary
+        run: |
+          echo "# 🚀 Container Build Summary" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📊 Build Statistics" >> $GITHUB_STEP_SUMMARY
+          echo "- **Total changed containers:** ${CONTAINER_COUNT}" >> $GITHUB_STEP_SUMMARY
+          echo "- **Sync status:** ${{ needs.sync-upstream.outputs.has-changes == 'true' && '✅ Changes synced from upstream' || '⏭️ No changes detected' }}" >> $GITHUB_STEP_SUMMARY
+
+          if [ "${HAS_CHANGES}" = "false" ]; then
+            echo "- **Build status:** ⏭️ No containers changed - no builds needed" >> $GITHUB_STEP_SUMMARY
+          else
+            # Determine the appropriate build status message
+            if [ "${BUILD_RESULT}" = "success" ]; then
+              echo "- **Build status:** ✅ All builds completed successfully" >> $GITHUB_STEP_SUMMARY
+            elif [ "${BUILD_RESULT}" = "failure" ]; then
+              echo "- **Build status:** ❌ Some build failures detected" >> $GITHUB_STEP_SUMMARY
+            else
+              echo "- **Build status:** ${BUILD_RESULT}" >> $GITHUB_STEP_SUMMARY
+            fi
+
+            echo "- **Manifest status:** ${PUSH_MANIFEST_RESULT}" >> $GITHUB_STEP_SUMMARY
+          fi
+
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## Registry Information" >> $GITHUB_STEP_SUMMARY
+          echo "All images are published to: \`ghcr.io/${{ github.repository_owner }}/bitnami-oss/\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Next Sync" >> $GITHUB_STEP_SUMMARY
+          echo "The next automatic sync is scheduled for tomorrow at midnight UTC." >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "---" >> $GITHUB_STEP_SUMMARY
+          echo "*This workflow automatically syncs with [bitnami/containers](https://github.com/bitnami/containers) and builds only changed container images.*" >> $GITHUB_STEP_SUMMARY
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CONTAINER_COUNT: ${{ needs.sync-upstream.outputs.containers-count }}
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
+          PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
+
+      - name: Report status
+        run: |
+          if [ "${HAS_CHANGES}" = "false" ]; then
+            echo "✅ Sync completed successfully - no container changes detected, no builds needed!"
+          elif [ "${BUILD_RESULT}" = "success" ] && [ "${PUSH_MANIFEST_RESULT}" = "success" ]; then
+            echo "🎉 All changed container builds and manifests completed successfully!"
+          else
+            echo "❌ Some builds or manifests failed. Check the job logs for details."
+            exit 1
+          fi
+
+        env:
+          BUILD_RESULT: ${{ needs.build.result }}
+          CONTAINER_COUNT: ${{ needs.sync-upstream.outputs.containers-count }}
+          HAS_CHANGES: ${{ needs.sync-upstream.outputs.has-changes }}
+          PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
+
+  rollback-on-failure:
+    runs-on: ubuntu-24.04
+    name: Rollback main branch on critical failure
+    needs: [sync-upstream, build, push-manifests]
+    if: failure() && needs.sync-upstream.outputs.has-changes == 'true'
+    permissions:
+      contents: write
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+        with:
+          fetch-depth: 0
+          persist-credentials: true
+          ref: main
+          token: ${{ github.token }}
+
+      - name: Add upstream remote
+        run: |
+          git remote add upstream https://github.com/bitnami/containers.git || true
+          git remote set-url upstream https://github.com/bitnami/containers.git
+
+      - name: Rollback main branch to pre-sync state
+        run: |
+          echo "🔄 BUILD FAILURE DETECTED - Rolling back main branch"
+          echo "Original commit (before sync): ${LOCAL_COMMIT}"
+          echo "Current commit (after sync): ${UPSTREAM_COMMIT}"
+
+          # Reset main branch back to the pre-sync commit
+          git reset --hard ${LOCAL_COMMIT}
+
+          # Force push the rollback
+          git push origin main --force
+
+          echo "✅ Successfully rolled back main branch to pre-sync state"
+          echo "Main branch is now at: $(git rev-parse HEAD)"
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
+
+      - name: Add rollback comment to summary
+        run: |
+          echo "# ⚠️ BUILD FAILURE - ROLLBACK PERFORMED" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 🔄 Rollback Details" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reason**: Build failure detected" >> $GITHUB_STEP_SUMMARY
+          echo "- **Action**: Main branch rolled back to pre-sync state" >> $GITHUB_STEP_SUMMARY
+          echo "- **Previous commit**: \`${LOCAL_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "- **Reverted from**: \`${UPSTREAM_COMMIT}\`" >> $GITHUB_STEP_SUMMARY
+          echo "" >> $GITHUB_STEP_SUMMARY
+          echo "## 📋 Next Steps" >> $GITHUB_STEP_SUMMARY
+          echo "1. Check the build logs to identify the build failure" >> $GITHUB_STEP_SUMMARY
+          echo "2. The main branch has been restored to a working state" >> $GITHUB_STEP_SUMMARY
+          echo "3. The problematic upstream changes were not permanently synced" >> $GITHUB_STEP_SUMMARY
+          echo "4. The next sync will retry when upstream issues are resolved" >> $GITHUB_STEP_SUMMARY
+
+        env:
+          LOCAL_COMMIT: ${{ needs.sync-upstream.outputs.local-commit }}
+          UPSTREAM_COMMIT: ${{ needs.sync-upstream.outputs.upstream-commit }}
