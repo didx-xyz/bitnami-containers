@@ -322,13 +322,24 @@ jobs:
           version: v0.34.1
           cache-binary: false
 
+      # docker/login-action has no retry; ghcr.io intermittently returns
+      # "denied: denied" on otherwise-valid tokens. Retry with backoff.
       - name: Log in to GitHub Container Registry
         if: steps.skip-check.outputs.should-skip == 'false'
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+        env:
+          GHCR_USERNAME: ${{ github.repository_owner }}
+          GHCR_PASSWORD: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if echo "$GHCR_PASSWORD" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            wait=$((attempt * 5))
+            echo "::warning::ghcr.io login failed (attempt $attempt/5); retrying in ${wait}s..."
+            sleep "$wait"
+          done
+          echo "::error::ghcr.io login failed after 5 attempts"
+          exit 1
 
       - name: Check if Dockerfile exists and get ref name
         if: steps.skip-check.outputs.should-skip == 'false'
@@ -385,8 +396,6 @@ jobs:
           push: true
           tags: ${{ steps.meta.outputs.tags }}
           labels: ${{ steps.meta.outputs.labels }}
-          cache-from: type=gha,scope=${{ matrix.container.name }}-${{ matrix.arch }}
-          cache-to: type=gha,mode=max,scope=${{ matrix.container.name }}-${{ matrix.arch }}
           build-args: |
             TARGETARCH=${{ matrix.arch }}
 
@@ -464,15 +473,38 @@ jobs:
             type=raw,value=latest
 
       - name: Log in to GitHub Container Registry
-        uses: docker/login-action@650006c6eb7dba73a995cc03b0b2d7f5ca915bee # v4.2.0
-        with:
-          registry: ghcr.io
-          username: ${{ github.repository_owner }}
-          password: ${{ github.token }}
+        env:
+          GHCR_USERNAME: ${{ github.repository_owner }}
+          GHCR_PASSWORD: ${{ github.token }}
+        run: |
+          for attempt in 1 2 3 4 5; do
+            if echo "$GHCR_PASSWORD" | docker login ghcr.io -u "$GHCR_USERNAME" --password-stdin; then
+              exit 0
+            fi
+            wait=$((attempt * 5))
+            echo "::warning::ghcr.io login failed (attempt $attempt/5); retrying in ${wait}s..."
+            sleep "$wait"
+          done
+          echo "::error::ghcr.io login failed after 5 attempts"
+          exit 1
 
       - name: Create and push manifests
         if: steps.check-dockerfile.outputs.exists == 'true'
         run: |
+          # Retry a command up to 5 times with linear backoff. Used to absorb
+          # transient ghcr.io errors (5xx, throttling, denied: denied).
+          retry() {
+            local attempt=1
+            while [ "$attempt" -le 5 ]; do
+              if "$@"; then return 0; fi
+              local wait=$((attempt * 5))
+              echo "::warning::Command failed (attempt $attempt/5): $*; retrying in ${wait}s..."
+              sleep "$wait"
+              attempt=$((attempt + 1))
+            done
+            return 1
+          }
+
           # Check which architectures were successfully built
           base_image="ghcr.io/${{ github.repository_owner }}/bitnami-oss/${{ matrix.container.name }}"
           amd64_image="${base_image}:${{ steps.check-dockerfile.outputs.ref-name }}-amd64"
@@ -480,17 +512,17 @@ jobs:
 
           echo "Checking available architectures..."
 
-          # Check AMD64 availability (required)
-          if docker buildx imagetools inspect "$amd64_image" >/dev/null 2>&1; then
+          # Check AMD64 availability (required). Retry to distinguish missing from flaky.
+          if retry docker buildx imagetools inspect "$amd64_image" >/dev/null 2>&1; then
             echo "✅ AMD64 image available"
             manifest_images="$amd64_image"
             arch_summary="linux/amd64"
           else
-            echo "❌ CRITICAL: AMD64 image not available: $amd64_image"
+            echo "❌ CRITICAL: AMD64 image not available after retries: $amd64_image"
             exit 1
           fi
 
-          # Check ARM64 availability (optional)
+          # Check ARM64 availability (optional). Single attempt; missing ARM64 is expected.
           if docker buildx imagetools inspect "$arm64_image" >/dev/null 2>&1; then
             echo "✅ ARM64 image available"
             manifest_images="$manifest_images $arm64_image"
@@ -506,7 +538,7 @@ jobs:
           echo "$tags" | while IFS= read -r tag; do
             if [ -n "$tag" ]; then
               echo "Creating manifest: $tag"
-              docker buildx imagetools create -t "$tag" $manifest_images
+              retry docker buildx imagetools create -t "$tag" $manifest_images
             fi
           done
 
