@@ -248,20 +248,41 @@ jobs:
           ref: ${{ matrix.container.commit_hash }}
           persist-credentials: false
 
-      - name: Restore .vib directory from publish branch
+      # Only arm64 needs vib-verify.json (for the architecture support check).
+      # Fetch just the single file via raw.githubusercontent.com instead of
+      # cloning the publish branch — ~1s vs ~1min for the full fetch.
+      - name: Fetch vib-verify.json from publish branch
+        if: matrix.arch == 'arm64'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          CONTAINER_NAME: ${{ matrix.container.name }}
+          REPO: ${{ github.repository }}
         run: |
-          # Fetch the publish branch to get .vib files
-          git fetch origin publish
-
-          # Checkout only the .vib directory from publish branch
-          git checkout origin/publish -- .vib/ 2>/dev/null || echo "⚠️ .vib directory not found in publish branch"
-
-          if [ -d .vib ]; then
-            echo "✅ Restored .vib directory from publish branch"
-            ls -la .vib/ | head -10
-          else
-            echo "⚠️ No .vib directory available"
-          fi
+          mkdir -p ".vib/${CONTAINER_NAME}"
+          url="https://raw.githubusercontent.com/${REPO}/publish/.vib/${CONTAINER_NAME}/vib-verify.json"
+          out=".vib/${CONTAINER_NAME}/vib-verify.json"
+          for attempt in 1 2 3; do
+            http_code=$(curl -sS -o "$out" -w "%{http_code}" \
+              -H "Authorization: Bearer ${GH_TOKEN}" "$url") || http_code="000"
+            case "$http_code" in
+              200)
+                echo "✅ Fetched vib-verify.json for ${CONTAINER_NAME}"
+                exit 0
+                ;;
+              404)
+                # Legitimately not published yet (e.g. new container).
+                # skip-check will then treat arm64 as unsupported.
+                rm -f "$out"
+                echo "ℹ️ No vib-verify.json on publish branch for ${CONTAINER_NAME} (arm64 will be skipped)"
+                exit 0
+                ;;
+            esac
+            wait=$((attempt * 5))
+            echo "::warning::Fetch failed (HTTP ${http_code}, attempt ${attempt}/3); retrying in ${wait}s..."
+            sleep "$wait"
+          done
+          echo "::error::Failed to fetch vib-verify.json for ${CONTAINER_NAME} after 3 attempts (last HTTP code: ${http_code}): ${url}"
+          exit 1
 
       - name: Check if ARM64 build should be skipped
         id: skip-check
