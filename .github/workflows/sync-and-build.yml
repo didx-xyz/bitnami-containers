@@ -23,7 +23,7 @@ concurrency:
 jobs:
   ## Always automatically keep `main` in sync with `upstream/main`
   sync-upstream:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Sync with upstream
     outputs:
       has-changes: ${{ steps.sync.outputs.has-changes }}
@@ -233,9 +233,9 @@ jobs:
         arch: [amd64, arm64]
         include:
           - arch: amd64
-            runs-on: ubuntu-24.04
+            runs-on: ubuntu-26.04
           - arch: arm64
-            runs-on: ubuntu-24.04-arm
+            runs-on: ubuntu-26.04-arm
 
     permissions:
       contents: read
@@ -431,7 +431,7 @@ jobs:
 
   push-manifests:
     name: Push
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: [sync-upstream, build]
     if: needs.sync-upstream.outputs.has-changes == 'true' && needs.sync-upstream.outputs.containers-count != '0' && needs.build.result != 'cancelled'
     strategy:
@@ -580,7 +580,7 @@ jobs:
           echo "   🏗️  Architectures: $architectures"
 
   build-summary:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Build Summary
     needs: [sync-upstream, build, push-manifests]
     if: always()
@@ -641,7 +641,7 @@ jobs:
           PUSH_MANIFEST_RESULT: ${{ needs.push-manifests.result }}
 
   rollback-on-failure:
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     name: Rollback main branch on critical failure
     needs: [sync-upstream, build, push-manifests]
     if: failure() && needs.sync-upstream.outputs.has-changes == 'true'

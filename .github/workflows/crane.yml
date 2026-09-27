@@ -18,7 +18,7 @@ permissions: {}
 jobs:
   generate-matrix:
     name: Generate matrix
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     outputs:
       matrix: ${{ steps.generate-matrix.outputs.matrix }}
     steps:
@@ -41,7 +41,7 @@ jobs:
 
   crane:
     name: Copy ${{ matrix.image }}
-    runs-on: ubuntu-24.04
+    runs-on: ubuntu-26.04
     needs: generate-matrix
     permissions:
       packages: write
